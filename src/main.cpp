@@ -5,80 +5,70 @@
  * then off for one second, repeatedly.
  */
 #include "Arduino.h"
-#include "pico/stdlib.h"
-#include "pio_usb.h"
+#include "Wire.h"
+#include "AccelStepper.h"
 
-#define HOST_PIN_DP   2   // Pin used as D+ for host, D- = D+ + 1
+#define EN_PIN    14 								// LOW: Driver enabled. HIGH: Driver disabled
+#define STEP_PIN  13 								// Step on rising edge
+#define DIR_PIN 12
 
-#include "Adafruit_TinyUSB.h"
+// #include <TMC2208Stepper.h>							// Include library
+// TMC2208Stepper driver = TMC2208Stepper(&Serial2);	// Create driver and use
 
+int counter = 0;
 
-#define LANGUAGE_ID 0x0409  // English
-
-Adafruit_USBH_Host USBHost;
-
-// holding device descriptor
-tusb_desc_device_t desc_device;
-
+AccelStepper stepper = AccelStepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
 void setup()
 {
-  Serial1.begin(115200);
-
   Serial.begin(115200);
-  while ( !Serial ) delay(10);   // wait for native usb
 
-  Serial.println("TinyUSB Dual Device Info Example");
+  stepper.setEnablePin(EN_PIN);
+  stepper.setPinsInverted(false, false, true);
+
+
+	// pinMode(EN_PIN, OUTPUT);
+  // pinMode(STEP_PIN, OUTPUT);
+  // pinMode(DIR_PIN, OUTPUT);
+	// digitalWrite(EN_PIN, LOW);							// Enable driver
+
+  stepper.setCurrentPosition(0);
+  stepper.setMaxSpeed(2000);
+  stepper.setAcceleration(4000);
+
+  stepper.enableOutputs();
+
+  stepper.setSpeed(5000);
+
 }
 
 void loop()
 {
-  Serial.println("USBHost.begin()");
-  if (Serial1.available()) {
-    Serial.println("Device connected");
-  }
-}
+  // Serial.println(stepper.currentPosition());
 
+  long pos = stepper.currentPosition();
 
-// core1's setup
-void setup1() {
-  while ( !Serial ) delay(10);   // wait for native usb
-  Serial.println("Core1 setup to run TinyUSB host with pio-usb");
-
-  // Check for CPU frequency, must be multiple of 120Mhz for bit-banging USB
-  uint32_t cpu_hz = clock_get_hz(clk_sys);
-  if ( cpu_hz != 120000000UL && cpu_hz != 240000000UL ) {
-    while ( !Serial ) delay(10);   // wait for native usb
-    Serial.printf("Error: CPU Clock = %u, PIO USB require CPU clock must be multiple of 120 Mhz\r\n", cpu_hz);
-    Serial.printf("Change your CPU Clock to either 120 or 240 Mhz in Menu->CPU Speed \r\n", cpu_hz);
-    while(1) delay(1);
+  if (pos > 10000) {
+    stepper.setSpeed(-2000);
   }
 
-  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-  pio_cfg.pin_dp = HOST_PIN_DP;
- 
- #if defined(ARDUINO_RASPBERRY_PI_PICO_W)
-  /* https://github.com/sekigon-gonnoc/Pico-PIO-USB/issues/46 */
-  pio_cfg.sm_tx      = 3;
-  pio_cfg.sm_rx      = 2;
-  pio_cfg.sm_eop     = 3;
-  pio_cfg.pio_rx_num = 0;
-  pio_cfg.pio_tx_num = 1;
-  pio_cfg.tx_ch      = 9;
- #endif /* ARDUINO_RASPBERRY_PI_PICO_W */
- 
-  USBHost.configure_pio_usb(1, &pio_cfg);
+  if (pos < 3000) {
+    stepper.setSpeed(2000);
+  }
 
-  Serial.println("USBHost.begin()");
+  // stepper.moveTo(200);
+  stepper.runSpeed();
+ 	// digitalWrite(STEP_PIN, HIGH); // Step
+  // delay(delay_time);
+  // digitalWrite(STEP_PIN, LOW); // Step
+  // delay(delay_time);
+  // // delayMicroseconds(500);
+  // // counter += 1;
 
-  // run host stack on controller (rhport) 1
-  // Note: For rp2040 pico-pio-usb, calling USBHost.begin() on core1 will have most of the
-  // host bit-banging processing works done in core1 to free up core0 for other works
-  USBHost.begin(1);
+  // // if (counter == 5000) {
+  // //    	digitalWrite(DIR_PIN, !digitalRead(DIR_PIN)); // Step
+  // //     counter = 0;
+  // // }
+	// // delay(1);
 }
 
-// core1's loop
-void loop1()
-{
-  USBHost.task();
-}
