@@ -24,7 +24,13 @@ u_int32_t rolling_avg = 0;
 
 AccelStepper stepper = AccelStepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
 
-u_int32_t safe_subtract()
+u_int32_t sat_subu32b(u_int32_t x, u_int32_t y)
+{
+	u_int32_t res = x - y;
+	res &= -(res <= x);
+	
+	return res;
+}
 
 
 void setup()
@@ -69,22 +75,12 @@ void loop()
   // stepper.moveTo(200);
   stepper.runSpeed();
 
-  rolling_avg = rolling_avg * 0.99 + 0.01 * analogRead(CURRENT_PIN);
+  // rolling_avg = rolling_avg * 0.99 + 0.01 * analogRead(CURRENT_PIN);
 
-  // Ranges from about 3300 to about 3500
-  uint32_t voltage = rolling_avg - 3300;
+  // Ranges from about 3100 to about 3500
+  uint32_t current_ma = sat_subu32b(analogRead(CURRENT_PIN), 3120) * 13;
 
-  if (rolling_avg < 3350) {
-    Serial.println("OFF");
-  } else if (rolling_avg < 3450) {
-    Serial.println("1");
-  } else if (rolling_avg < 3500) {
-    Serial.println("2");
-  } else if (rolling_avg < 3600) {
-    Serial.println("3");
-  } else {
-    Serial.println("HMMMM");
-  }
+  if (current_ma =)
 
  	// digitalWrite(STEP_PIN, HIGH); // Step
   // delay(delay_time);
