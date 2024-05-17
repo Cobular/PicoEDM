@@ -11,17 +11,12 @@
 #![no_main]
 
 use cortex_m::singleton;
-use critical_section::Mutex;
 use embedded_hal::digital::OutputPin;
-use hal::dma;
-use hal::dma::Channel;
-use hal::dma::Channels;
+use fugit::ExtU64;
 use hal::dma::SingleChannel;
 
-use hal::dma::CH0;
 // The macro for our start-up function
 use rp_pico::entry;
-use rp_pico::hal::pac::interrupt;
 
 
 // GPIO traits
@@ -48,31 +43,18 @@ use rp_pico::hal::uart::DataBits;
 use rp_pico::hal::uart::StopBits;
 use rp_pico::hal::uart::UartConfig;
 use fugit::RateExtU32;
-use core::cell::RefCell;
 use core::fmt::Write;
-use core::ops::Deref;
 
 
 const DUTY_CYCLE_PERCENT: u16 = 30;
 
-type TransferData<'a> = single_buffer::Transfer<Channel<CH0>, hal::adc::DmaReadTarget<u16>, &'a mut [u16; 128]>;
+const BIN_WIDTH : usize = 32;
 
-type UartPerip = hal::uart::UartPeripheral<hal::uart::Enabled, pac::UART0, (hal::gpio::Pin<hal::gpio::bank0::Gpio0, hal::gpio::FunctionUart, hal::gpio::PullDown>, hal::gpio::Pin<hal::gpio::bank0::Gpio1, hal::gpio::FunctionUart, hal::gpio::PullDown>)>;
+const SAMPLE_BATCH_SIZE: usize = 1024 * 16;
 
-/// Since we're always accessing these pins together we'll store them in a tuple.
-/// Giving this tuple a type alias means we won't need to use () when putting them
-/// inside an Option. That will be easier to read.
-type DmaData = (TransferData<'static>, UartPerip);
-
-/// This how we transfer our LED pin, input pin and PWM slice into the Interrupt Handler.
-/// We'll have the option hold both using the LedAndInput type.
-/// This will make it a bit easier to unpack them later.
-static GLOBAL_PINS: Mutex<RefCell<Option<DmaData>>> = Mutex::new(RefCell::new(None));
-
-
-fn average_samples(samples: &[u16; 128]) -> u32 {
+fn average_samples(samples: &[u16; BIN_WIDTH]) -> u32 {
     let sum: u32 = samples.iter().map(|&x| x as u32).sum();
-    sum >> 7
+    sum >> 6
 }
 
 
@@ -125,21 +107,16 @@ fn main() -> ! {
     );
 
     // Create a UART driver
-    let uart: UartPerip = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
+    let mut uart = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
         .enable(
-            UartConfig::new(115200.Hz(), DataBits::Eight, None, StopBits::One),
+            UartConfig::new(256000.Hz(), DataBits::Eight, None, StopBits::One),
             clocks.peripheral_clock.freq(),
         )
         .unwrap();
 
-    uart.write_full_blocking(b"ADC FIFO DMA example\r\n");
-
     let mut led_pin = pins.led.into_push_pull_output();
+    let mut led_pin_state = false;
     led_pin.set_high().unwrap();
-
-    // The delay object lets us wait for specified amounts of time (in
-    // milliseconds)
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
     // Init PWMs
     let mut pwm_slices = hal::pwm::Slices::new(pac.PWM, &mut pac.RESETS);
@@ -178,7 +155,7 @@ fn main() -> ! {
 
     // we'll capture 1000 samples in total (500 per channel)
     // NOTE: when calling `shift_8bit` below, the type here must be changed from `u16` to `u8`
-    let buf_for_samples = singleton!(: [u16; 128] = [0; 128]).unwrap();
+    let buf_for_samples = singleton!(: [u16; BIN_WIDTH] = [0; BIN_WIDTH]).unwrap();
 
     // To average, we sum all samples into a u32 then shift right by 7 (divide by 128)
 
@@ -201,55 +178,51 @@ fn main() -> ! {
     dma.ch0.enable_irq0();
 
     // Start a DMA transfer (must happen before resuming the ADC FIFO)
-    let dma_transfer: TransferData =
+    let mut dma_transfer =
         single_buffer::Config::new(dma.ch0, adc_fifo.dma_read_target(), buf_for_samples).start();
 
     // Resume the FIFO to start capturing
     adc_fifo.resume();
 
-    // Give away our pins by moving them into the `GLOBAL_PINS` variable.
-    // We won't need to access them in the main thread again
-    critical_section::with(|cs| {
-        GLOBAL_PINS.borrow(cs).replace(Some((dma_transfer, uart)));
-    });
-    adc_fifo.resume();
+    let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
-    // Give away our pins by moving them into the `GLOBAL_PINS` variable.
-    // We won't need to access them in the main thread again
-    critical_section::with(|cs| {
-        GLOBAL_PINS.borrow(cs).replace(Some((dma_transfer, uart)));
-    });
+    let mut next_time = timer.get_counter() + 500.millis();
 
-    // let timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+    let double_buf = singleton!(: [u16; BIN_WIDTH] = [0; BIN_WIDTH]).unwrap();
 
-    // let time_taken = timer.get_counter();
+    let mut answer_buffer: [u32; SAMPLE_BATCH_SIZE] = [0; SAMPLE_BATCH_SIZE];
+    
+    let mut counter = 0;
 
-    // uart.write_full_blocking(b"Done sampling, printing results:\r\n");
 
     // Infinite loop, fading LED up and down
     loop {
-        led_pin.set_high().unwrap();
-        delay.delay_ms(500);
-        led_pin.set_low().unwrap();
-        delay.delay_ms(500);
+        if timer.get_counter() > next_time {
+            if led_pin_state {
+                led_pin.set_low().unwrap();
+                led_pin_state = false;
+            } else {
+                led_pin.set_high().unwrap();
+                led_pin_state = true;
+            }
+            next_time += 500.millis();
+        }
 
         if dma_transfer.is_done() {
-            let dma_data = GLOBAL_PINS.borrow(cs).take();
+            let (ch, read_target, buf_for_samples) = dma_transfer.wait();
+            buf_for_samples.swap_with_slice(double_buf);
+            dma_transfer = single_buffer::Config::new(ch, read_target, buf_for_samples).start();
+            adc_fifo.resume();
+            let average = average_samples(double_buf);
+            answer_buffer[counter] = average;
+            counter += 1;
+        }
 
-            if let Some((dma_transfer, mut uart)) = dma_data {
-                let (ch, adc_read_target, buf_for_samples) = dma_transfer.wait();
-        
-                // Average the samples
-                let average = average_samples(buf_for_samples);
-        
-                // Print the average
-                writeln!(uart, "Average: {}\r", average).unwrap();
-        
-                let new_dma_transfer =
-                    single_buffer::Config::new(ch, adc_read_target, buf_for_samples).start();
-        
-                GLOBAL_PINS.borrow(cs).replace(Some((new_dma_transfer, uart)));
+        if counter == SAMPLE_BATCH_SIZE {
+            for sample in answer_buffer.iter() {
+                writeln!(uart, "{}\r", sample).unwrap();
             }
+            counter = 0;
         }
         // writeln!(
         //     uart,
@@ -260,29 +233,3 @@ fn main() -> ! {
         // .unwrap();
     }
 }
-
-
-// Interrupt handler for the DMA controller
-#[allow(non_snake_case)]
-#[interrupt]
-fn DMA_IRQ_0() {
-    critical_section::with(|cs| {
-        let dma_data = GLOBAL_PINS.borrow(cs).take();
-
-        if let Some((dma_transfer, mut uart, ..)) = dma_data {
-            let (ch, adc_read_target, buf_for_samples) = dma_transfer.wait();
-    
-            // Average the samples
-            let average = average_samples(buf_for_samples);
-
-            // Print the average
-            writeln!(uart, "Average: {}\r", average).unwrap();
-
-            let new_dma_transfer =
-                single_buffer::Config::new(ch, adc_read_target, buf_for_samples).start();
-
-            GLOBAL_PINS.borrow(cs).replace(Some((new_dma_transfer, uart)));
-        }
-    });
-}
-
