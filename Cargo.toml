@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "freq_gen",
+    "defmt-serial",
+]

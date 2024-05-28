@@ -10,7 +10,10 @@
 #![no_std]
 #![no_main]
 
+use cortex_m::asm::wfi;
+use cortex_m::delay;
 use cortex_m::singleton;
+use defmt::println;
 use embedded_hal::digital::OutputPin;
 use fugit::ExtU64;
 use hal::dma::SingleChannel;
@@ -18,12 +21,13 @@ use hal::dma::SingleChannel;
 // The macro for our start-up function
 use rp_pico::entry;
 
-
 // GPIO traits
 use embedded_hal::pwm::SetDutyCycle;
 
 // Ensure we halt the program on panic (if we don't mention this crate it won't
 // be linked)
+use defmt;
+use defmt_serial as _;
 use panic_halt as _;
 
 use rp_pico::hal::adc::AdcPin;
@@ -38,25 +42,35 @@ use rp_pico::hal::pac;
 
 // A shorter alias for the Hardware Abstraction Layer, which provides
 // higher-level drivers.
+use core::fmt::Write;
+use fugit::RateExtU32;
 use rp_pico::hal;
 use rp_pico::hal::uart::DataBits;
 use rp_pico::hal::uart::StopBits;
 use rp_pico::hal::uart::UartConfig;
-use fugit::RateExtU32;
-use core::fmt::Write;
+use static_cell::StaticCell;
 
+type FullUart = hal::uart::UartPeripheral<
+    hal::uart::Enabled,
+    pac::UART0,
+    (
+        hal::gpio::Pin<hal::gpio::bank0::Gpio0, hal::gpio::FunctionUart, hal::gpio::PullDown>,
+        hal::gpio::Pin<hal::gpio::bank0::Gpio1, hal::gpio::FunctionUart, hal::gpio::PullDown>,
+    ),
+>;
+
+static SERIAL: StaticCell<FullUart> = StaticCell::new();
 
 const DUTY_CYCLE_PERCENT: u16 = 30;
 
-const BIN_WIDTH : usize = 32;
+const BIN_WIDTH: usize = 32;
 
-const SAMPLE_BATCH_SIZE: usize = 1024 * 16;
+const SAMPLE_BATCH_SIZE: usize = 256 * 4;
 
 fn average_samples(samples: &[u16; BIN_WIDTH]) -> u32 {
     let sum: u32 = samples.iter().map(|&x| x as u32).sum();
     sum >> 6
 }
-
 
 /// Entry point to our bare-metal application.
 ///
@@ -107,12 +121,15 @@ fn main() -> ! {
     );
 
     // Create a UART driver
-    let mut uart = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
+    let uart: FullUart = hal::uart::UartPeripheral::new(pac.UART0, uart_pins, &mut pac.RESETS)
         .enable(
             UartConfig::new(256000.Hz(), DataBits::Eight, None, StopBits::One),
             clocks.peripheral_clock.freq(),
         )
         .unwrap();
+
+    let serial = SERIAL.init(uart);
+    defmt_serial::defmt_serial(serial);
 
     let mut led_pin = pins.led.into_push_pull_output();
     let mut led_pin_state = false;
@@ -142,7 +159,8 @@ fn main() -> ! {
 
     // We want a 30% duty cycle to start, so that's based on the top value
     // of 42, so 42 * 0.3 = 12.6, so 13
-    let _ = channel.set_duty_cycle(26);
+    let _ = channel.set_duty_cycle(42);
+    // let _ = channel.set_duty_cycle(26);
 
     // Initialize DMA
     let mut dma = pac.DMA.split(&mut pac.RESETS);
@@ -190,22 +208,14 @@ fn main() -> ! {
 
     let double_buf = singleton!(: [u16; BIN_WIDTH] = [0; BIN_WIDTH]).unwrap();
 
-    let mut answer_buffer: [u32; SAMPLE_BATCH_SIZE] = [0; SAMPLE_BATCH_SIZE];
-    
+    let mut answer_buffer: [u16; SAMPLE_BATCH_SIZE] = [0; SAMPLE_BATCH_SIZE];
+
     let mut counter = 0;
 
-
-    // Infinite loop, fading LED up and down
     loop {
-        if timer.get_counter() > next_time {
-            if led_pin_state {
-                led_pin.set_low().unwrap();
-                led_pin_state = false;
-            } else {
-                led_pin.set_high().unwrap();
-                led_pin_state = true;
-            }
-            next_time += 500.millis();
+        if timer.get_counter() > next_time && !led_pin_state {
+            led_pin.set_high().unwrap();
+            led_pin_state = true;
         }
 
         if dma_transfer.is_done() {
@@ -214,22 +224,22 @@ fn main() -> ! {
             dma_transfer = single_buffer::Config::new(ch, read_target, buf_for_samples).start();
             adc_fifo.resume();
             let average = average_samples(double_buf);
-            answer_buffer[counter] = average;
+
+            // // If the average is less than AVERAGE_CUTOFF, set the PWN duty cycle to 0 for half a second and write 0 to the answer buffer
+            // if average < 1300 {
+            //     channel.set_duty_cycle(42).unwrap();
+            //     led_pin.set_low().unwrap();
+            //     led_pin_state = false;
+            //     next_time = timer.get_counter() + 200.millis();
+            // }
+
+            answer_buffer[counter] = average as u16;
             counter += 1;
         }
 
         if counter == SAMPLE_BATCH_SIZE {
-            for sample in answer_buffer.iter() {
-                writeln!(uart, "{}\r", sample).unwrap();
-            }
+            println!("{=[?; 1024]}", answer_buffer);
             counter = 0;
         }
-        // writeln!(
-        //     uart,
-        //     "Took {}ms, average: {}\r",
-        //     time_taken,
-        //     average_samples(buf_for_samples)
-        // )
-        // .unwrap();
     }
 }

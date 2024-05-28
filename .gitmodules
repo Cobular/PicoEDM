@@ -1,0 +1,3 @@
+[submodule "defmt-serial"]
+	path = defmt-serial
+	url = git@github.com:Cobular/defmt-serial.git
